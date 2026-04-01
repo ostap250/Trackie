@@ -110,21 +110,23 @@ HELP_TEXT = (
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import html as html_lib
     user = update.effective_user
     db.upsert_user(user.id, user.username or user.first_name)
-    # Use @username if available, otherwise first name
-    name = f"@{user.username}" if user.username else user.first_name
+    # html.escape handles &, <, > — safe for any username/first_name
+    raw_name = f"@{user.username}" if user.username else user.first_name
+    name = html_lib.escape(raw_name)
     await update.message.reply_text(
         f"Привіт, {name}! 👋\n\n"
-        "Мене звати *Trackie* — я допоможу тобі не забувати слідкувати за здоров'ям: "
+        "Мене звати <b>Trackie</b> — я допоможу тобі не забувати слідкувати за здоров'ям: "
         "їжа, вага, вода, зал — все в одному місці.\n\n"
         + HELP_TEXT,
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT)
 
 
 # ── /log conversation ──────────────────────────────────────────────────────────
