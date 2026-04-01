@@ -9,6 +9,7 @@ Commands:
   /stats      — weekly summary (calories, protein, weight)
   /reminders  — manage daily reminders
   /today      — today's food log + totals
+  /help       — show all commands
   /cancel     — cancel current operation
 """
 
@@ -95,21 +96,35 @@ async def _send_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 
+HELP_TEXT = (
+    "Ось що я вмію:\n\n"
+    "  /log — записати їжу з бази продуктів\n"
+    "  /addproduct — додати свій продукт\n"
+    "  /weight — записати вагу\n"
+    "  /today — лог їжі за сьогодні\n"
+    "  /stats — тижнева статистика\n"
+    "  /reminders — нагадування (вода, зал, креатин)\n"
+    "  /help — показати цей список\n\n"
+    "Щоб скасувати будь-яку дію — /cancel"
+)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username or user.first_name)
+    # Use @username if available, otherwise first name
+    name = f"@{user.username}" if user.username else user.first_name
     await update.message.reply_text(
-        f"👋 Hey, {user.first_name}! I'm *Trackie* — your personal health assistant.\n\n"
-        "Here's what I can do:\n"
-        "  /log — log a meal from the product database\n"
-        "  /addproduct — add your own product\n"
-        "  /weight — record your weight\n"
-        "  /today — today's food log\n"
-        "  /stats — weekly summary\n"
-        "  /reminders — set daily reminders\n\n"
-        "Let's get started! 💪",
+        f"Привіт, {name}! 👋\n\n"
+        "Мене звати *Trackie* — я допоможу тобі не забувати слідкувати за здоров'ям: "
+        "їжа, вага, вода, зал — все в одному місці.\n\n"
+        + HELP_TEXT,
         parse_mode="Markdown",
     )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 # ── /log conversation ──────────────────────────────────────────────────────────
@@ -558,6 +573,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(log_conv)
