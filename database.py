@@ -86,7 +86,7 @@ class Database:
                 "SELECT id, name, calories_per_100g, protein_per_100g, user_id "
                 "FROM products "
                 "WHERE (user_id IS NULL OR user_id = ?) AND LOWER(name) LIKE ? "
-                "ORDER BY user_id NULLS LAST, name "  -- global first, then personal
+                "ORDER BY user_id NULLS LAST, name "  # global first, then personal
                 "LIMIT 8",
                 (user_id, pattern),
             ).fetchall()
