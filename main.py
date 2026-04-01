@@ -1,18 +1,20 @@
 """
-main.py — Trackie: personal health tracking Telegram bot.
+main.py — Trackie: персональний бот для відстеження здоров'я.
 
-Commands:
-  /start      — welcome message, register user
-  /log        — search product, enter grams, log meal
-  /addproduct — add a custom product to the database
-  /weight     — record today's weight
-  /stats      — weekly summary (calories, protein, weight)
-  /reminders  — manage daily reminders
-  /today      — today's food log + totals
-  /help       — show all commands
-  /cancel     — cancel current operation
+Команди:
+  /start      — привітання, реєстрація користувача
+  /log        — записати прийом їжі
+  /addproduct — додати власний продукт до бази
+  /weight     — записати вагу
+  /stats      — тижнева статистика
+  /reminders  — керування нагадуваннями
+  /plan       — нагадування і харчування за сьогодні
+  /today      — лог їжі за сьогодні
+  /help       — список команд
+  /cancel     — скасувати поточну дію
 """
 
+import html as html_lib
 import logging
 import os
 import re
@@ -32,7 +34,7 @@ from telegram.ext import (
 
 from database import Database
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
+# ── Налаштування ───────────────────────────────────────────────────────────────
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -45,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 db = Database("trackie.db")
 
-# ── ConversationHandler states ─────────────────────────────────────────────────
+# ── Стани ConversationHandler ──────────────────────────────────────────────────
 # /log
 WAITING_PRODUCT_SEARCH = 1
 WAITING_PRODUCT_GRAMS  = 2
@@ -56,24 +58,39 @@ WAITING_ADDPROD_PROTEIN  = 12
 # /weight
 WAITING_WEIGHT = 20
 # /reminders
-WAITING_REMINDER_TIME = 30
+WAITING_REMINDER_SELECT = 30  # очікування натискання кнопки меню
+WAITING_REMINDER_TIME   = 31  # очікування введення часу
 
-# ── Reminder config ────────────────────────────────────────────────────────────
+# ── Конфіг нагадувань ──────────────────────────────────────────────────────────
 REMINDER_TYPES = {
-    "water":    "💧 Water",
-    "gym":      "🏋️ Gym",
-    "creatine": "💊 Creatine",
+    "water":    "💧 Вода",
+    "gym":      "🏋️ Зал",
+    "creatine": "💊 Креатин",
 }
 
+# ── Текст допомоги (shared між /start і /help) ────────────────────────────────
+HELP_TEXT = (
+    "Ось що я вмію:\n\n"
+    "  /log — записати їжу\n"
+    "  /addproduct — додати свій продукт\n"
+    "  /weight — записати вагу\n"
+    "  /today — лог їжі за сьогодні\n"
+    "  /plan — нагадування і харчування на сьогодні\n"
+    "  /stats — тижнева статистика\n"
+    "  /reminders — налаштувати нагадування\n"
+    "  /help — показати цей список\n\n"
+    "Скасувати будь-яку дію — /cancel"
+)
 
-# ── Reminder helpers ───────────────────────────────────────────────────────────
+
+# ── Хелпери нагадувань ─────────────────────────────────────────────────────────
 
 def _reminder_job_name(user_id: int, rtype: str) -> str:
     return f"reminder_{user_id}_{rtype}"
 
 
 def _schedule_reminder(app: Application, user_id: int, rtype: str, time_str: str):
-    """Register (or replace) a daily reminder job in the job queue."""
+    """Реєструє (або замінює) щоденне нагадування у черзі завдань."""
     hour, minute = map(int, time_str.split(":"))
     job_name = _reminder_job_name(user_id, rtype)
 
@@ -85,35 +102,42 @@ def _schedule_reminder(app: Application, user_id: int, rtype: str, time_str: str
         time=time(hour=hour, minute=minute),
         chat_id=user_id,
         name=job_name,
-        data={"label": REMINDER_TYPES.get(rtype, rtype.capitalize())},
+        data={"label": REMINDER_TYPES.get(rtype, rtype)},
     )
 
 
 async def _send_reminder(context: ContextTypes.DEFAULT_TYPE):
     label = context.job.data["label"]
-    await context.bot.send_message(chat_id=context.job.chat_id, text=f"⏰ Reminder: {label}")
+    await context.bot.send_message(
+        chat_id=context.job.chat_id,
+        text=f"⏰ Нагадування: {label}",
+    )
+
+
+def _parse_time(text: str) -> tuple[int, int] | None:
+    """
+    Парсить час у форматах: 10:00, 10.00, 1000, 830.
+    Повертає (year, minute) або None якщо формат невірний.
+    """
+    text = text.strip().replace(".", ":")
+    # Формат без двокрапки: 930 → 09:30, 1000 → 10:00
+    if re.match(r"^\d{3,4}$", text):
+        text = text.zfill(4)
+        text = f"{text[:2]}:{text[2:]}"
+    if not re.match(r"^\d{1,2}:\d{2}$", text):
+        return None
+    hour, minute = map(int, text.split(":"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
 
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 
-HELP_TEXT = (
-    "Ось що я вмію:\n\n"
-    "  /log — записати їжу з бази продуктів\n"
-    "  /addproduct — додати свій продукт\n"
-    "  /weight — записати вагу\n"
-    "  /today — лог їжі за сьогодні\n"
-    "  /stats — тижнева статистика\n"
-    "  /reminders — нагадування (вода, зал, креатин)\n"
-    "  /help — показати цей список\n\n"
-    "Щоб скасувати будь-яку дію — /cancel"
-)
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import html as html_lib
     user = update.effective_user
     db.upsert_user(user.id, user.username or user.first_name)
-    # html.escape handles &, <, > — safe for any username/first_name
+    # html.escape безпечно обробляє будь-який нікнейм (з _ або &)
     raw_name = f"@{user.username}" if user.username else user.first_name
     name = html_lib.escape(raw_name)
     await update.message.reply_text(
@@ -133,102 +157,105 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔍 Enter a product name to search (e.g. *chicken*, *oat*, *egg*):",
+        "🔍 Введи назву продукту для пошуку (напр. *курка*, *вівсянка*, *яйце*):",
         parse_mode="Markdown",
     )
     return WAITING_PRODUCT_SEARCH
 
 
 async def handle_product_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search DB and show matching products as inline buttons."""
+    """Шукає продукти в БД і показує результати як inline-кнопки."""
     query = update.message.text.strip()
     user_id = update.effective_user.id
     results = db.search_products(user_id, query)
 
     if not results:
         await update.message.reply_text(
-            "❌ No products found for that query.\n\n"
-            "Try a different name, or use /addproduct to add it to your database.",
+            "❌ Продукт не знайдено.\n\n"
+            "Спробуй іншу назву або додай продукт через /addproduct",
         )
-        return WAITING_PRODUCT_SEARCH  # let them try again
+        return WAITING_PRODUCT_SEARCH
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{r['name']} ({r['calories_per_100g']:.0f} kcal / {r['protein_per_100g']:.0f}g P per 100g)",
+            f"{r['name']} ({r['calories_per_100g']:.0f} ккал / {r['protein_per_100g']:.0f}г білка на 100г)",
             callback_data=f"prod:{r['id']}",
         )]
         for r in results
     ]
-    keyboard.append([InlineKeyboardButton("🔍 Search again", callback_data="log_search_again")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="log_cancel")])
+    keyboard.append([InlineKeyboardButton("🔍 Пошукати ще раз", callback_data="log_search_again")])
+    keyboard.append([InlineKeyboardButton("❌ Скасувати", callback_data="log_cancel")])
 
     await update.message.reply_text(
-        f"Found *{len(results)}* result(s). Select a product:",
+        f"Знайдено *{len(results)}* результат(ів). Обери продукт:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
-    return WAITING_PRODUCT_SEARCH  # stay here until user taps a button
+    return WAITING_PRODUCT_SEARCH
 
 
 async def handle_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User tapped a product button — ask how many grams."""
+    """Користувач натиснув кнопку продукту — питаємо кількість грамів."""
     query = update.callback_query
     await query.answer()
 
     if query.data == "log_cancel":
-        await query.edit_message_text("Cancelled.")
+        await query.edit_message_text("Скасовано.")
         return ConversationHandler.END
 
     if query.data == "log_search_again":
-        await query.edit_message_text("🔍 Enter a new product name:")
+        await query.edit_message_text("🔍 Введи нову назву продукту:")
         return WAITING_PRODUCT_SEARCH
 
     product_id = int(query.data.split(":", 1)[1])
     product = db.get_product_by_id(product_id)
     if not product:
-        await query.edit_message_text("⚠️ Product not found. Please try again with /log.")
+        await query.edit_message_text("⚠️ Продукт не знайдено. Спробуй /log ще раз.")
         return ConversationHandler.END
 
     context.user_data["selected_product"] = product
     await query.edit_message_text(
         f"✅ *{product['name']}*\n"
-        f"Per 100g: {product['calories_per_100g']:.0f} kcal, {product['protein_per_100g']:.0f}g protein\n\n"
-        f"How many grams did you eat?",
+        f"На 100г: {product['calories_per_100g']:.0f} ккал, {product['protein_per_100g']:.0f}г білка\n\n"
+        f"Скільки грамів з'їв?",
         parse_mode="Markdown",
     )
     return WAITING_PRODUCT_GRAMS
 
 
 async def handle_grams(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Calculate nutrition based on grams and save to food_log."""
+    """Рахує калорії/білок за вагою і зберігає запис."""
     text = update.message.text.strip().replace(",", ".")
     user_id = update.effective_user.id
     product = context.user_data.get("selected_product")
 
     if not product:
-        await update.message.reply_text("⚠️ Something went wrong. Please start over with /log.")
+        await update.message.reply_text("⚠️ Щось пішло не так. Почни знову з /log.")
         return ConversationHandler.END
 
     try:
         grams = float(text)
         if grams <= 0 or grams > 5000:
-            raise ValueError("Unrealistic amount")
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Enter a valid number of grams, e.g. *150*", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ Введи коректну кількість грамів, напр. *150*",
+            parse_mode="Markdown",
+        )
         return WAITING_PRODUCT_GRAMS
 
     calories = round(product["calories_per_100g"] * grams / 100, 1)
     protein  = round(product["protein_per_100g"]  * grams / 100, 1)
-    description = f"{product['name']} {grams:.0f}g"
+    description = f"{product['name']} {grams:.0f}г"
 
     db.add_food(user_id, description, calories, protein)
     context.user_data.pop("selected_product", None)
 
     await update.message.reply_text(
-        f"✅ *Logged!*\n\n"
+        f"✅ *Записано!*\n\n"
         f"📋 {description}\n"
-        f"🔥 Calories: *{calories} kcal*\n"
-        f"💪 Protein: *{protein} g*",
+        f"🔥 Калорії: *{calories} ккал*\n"
+        f"💪 Білок: *{protein} г*",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -238,7 +265,7 @@ async def handle_grams(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "➕ *Add a custom product*\n\nStep 1/3 — Enter the product name:",
+        "➕ *Додати власний продукт*\n\nКрок 1/3 — Введи назву продукту:",
         parse_mode="Markdown",
     )
     return WAITING_ADDPROD_NAME
@@ -247,12 +274,12 @@ async def cmd_addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_addprod_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if len(name) < 2:
-        await update.message.reply_text("⚠️ Name is too short. Try again:")
+        await update.message.reply_text("⚠️ Назва занадто коротка. Спробуй ще раз:")
         return WAITING_ADDPROD_NAME
 
     context.user_data["new_product_name"] = name
     await update.message.reply_text(
-        f"Step 2/3 — *Calories per 100g* for _{name}_?\n(e.g. `165`)",
+        f"Крок 2/3 — *Калорії на 100г* для _{name}_?\n(напр. `165`)",
         parse_mode="Markdown",
     )
     return WAITING_ADDPROD_CALORIES
@@ -265,12 +292,12 @@ async def receive_addprod_calories(update: Update, context: ContextTypes.DEFAULT
         if calories < 0 or calories > 1000:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Enter a valid number between 0 and 1000:")
+        await update.message.reply_text("⚠️ Введи число від 0 до 1000:")
         return WAITING_ADDPROD_CALORIES
 
     context.user_data["new_product_calories"] = calories
     await update.message.reply_text(
-        "Step 3/3 — *Protein per 100g* (grams)?\n(e.g. `31`)",
+        "Крок 3/3 — *Білок на 100г* (у грамах)?\n(напр. `31`)",
         parse_mode="Markdown",
     )
     return WAITING_ADDPROD_PROTEIN
@@ -285,19 +312,18 @@ async def receive_addprod_protein(update: Update, context: ContextTypes.DEFAULT_
         if protein < 0 or protein > 100:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("⚠️ Enter a valid number between 0 and 100:")
+        await update.message.reply_text("⚠️ Введи число від 0 до 100:")
         return WAITING_ADDPROD_PROTEIN
 
     name     = context.user_data.pop("new_product_name")
     calories = context.user_data.pop("new_product_calories")
-
     db.add_product(user_id, name, calories, protein)
 
     await update.message.reply_text(
-        f"✅ Product added!\n\n"
+        f"✅ Продукт додано!\n\n"
         f"*{name}*\n"
-        f"🔥 {calories:.0f} kcal | 💪 {protein:.0f}g protein — per 100g\n\n"
-        f"You can now find it when using /log.",
+        f"🔥 {calories:.0f} ккал | 💪 {protein:.0f}г білка — на 100г\n\n"
+        f"Тепер можеш знайти його через /log.",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -307,7 +333,7 @@ async def receive_addprod_protein(update: Update, context: ContextTypes.DEFAULT_
 
 async def cmd_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚖️ Enter your current weight in kg (e.g. *74.5*):",
+        "⚖️ Введи свою поточну вагу в кг (напр. *74.5*):",
         parse_mode="Markdown",
     )
     return WAITING_WEIGHT
@@ -322,13 +348,13 @@ async def receive_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
         db.add_weight(user_id, weight)
         await update.message.reply_text(
-            f"✅ Weight recorded: *{weight} kg*\n"
-            f"📅 {datetime.now().strftime('%d %b %Y, %H:%M')}",
+            f"✅ Вага записана: *{weight} кг*\n"
+            f"📅 {datetime.now().strftime('%d.%m.%Y, %H:%M')}",
             parse_mode="Markdown",
         )
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Please send a valid weight number, e.g. *74.5*",
+            "⚠️ Введи коректне число, напр. *74.5*",
             parse_mode="Markdown",
         )
     return ConversationHandler.END
@@ -341,7 +367,9 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries = db.get_today_food(user_id)
 
     if not entries:
-        await update.message.reply_text("📭 No food logged today yet. Use /log to add a meal!")
+        await update.message.reply_text(
+            "📭 Сьогодні ще нічого не записано. Використай /log щоб додати їжу!"
+        )
         return
 
     total_cal  = sum(e["calories"] or 0 for e in entries)
@@ -349,15 +377,63 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     for i, e in enumerate(entries, 1):
-        ts = e["timestamp"][11:16]  # HH:MM
+        ts = e["timestamp"][11:16]
         lines.append(
-            f"{i}. _{e['description']}_ — {e['calories']:.0f} kcal, {e['protein']:.1f}g protein ({ts})"
+            f"{i}. _{e['description']}_ — {e['calories']:.0f} ккал, {e['protein']:.1f}г білка ({ts})"
         )
 
     await update.message.reply_text(
-        f"📅 *Today's food log*\n\n" + "\n".join(lines) +
+        f"📅 *Їжа за сьогодні*\n\n" + "\n".join(lines) +
         f"\n\n━━━━━━━━━━━━\n"
-        f"🔥 Total: *{total_cal:.0f} kcal* | 💪 *{total_prot:.1f} g protein*",
+        f"🔥 Разом: *{total_cal:.0f} ккал* | 💪 *{total_prot:.1f} г білка*",
+        parse_mode="Markdown",
+    )
+
+
+# ── /plan ──────────────────────────────────────────────────────────────────────
+
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Дашборд: нагадування + харчування за сьогодні."""
+    user_id = update.effective_user.id
+
+    # Нагадування
+    reminders = db.get_user_reminders(user_id)
+    if reminders:
+        reminder_lines = []
+        for r in reminders:
+            label = REMINDER_TYPES.get(r["reminder_type"], r["reminder_type"])
+            reminder_lines.append(f"  {label} — {r['time']}")
+        reminder_section = "\n".join(reminder_lines)
+    else:
+        reminder_section = "  Немає нагадувань. Налаштуй через /reminders"
+
+    # Харчування за сьогодні
+    entries = db.get_today_food(user_id)
+    total_cal  = sum(e["calories"] or 0 for e in entries)
+    total_prot = sum(e["protein"]  or 0 for e in entries)
+
+    if entries:
+        food_section = (
+            f"  🔥 Калорії: *{total_cal:.0f} ккал*\n"
+            f"  💪 Білок: *{total_prot:.1f} г*\n"
+            f"  🍽 Прийомів їжі: {len(entries)}"
+        )
+    else:
+        food_section = "  Ще нічого не записано сьогодні"
+
+    # Вага (остання запис)
+    weights = db.get_week_weights(user_id)
+    if weights:
+        last_w = weights[-1]["weight"]
+        weight_line = f"\n⚖️ *Остання вага:* {last_w} кг"
+    else:
+        weight_line = ""
+
+    await update.message.reply_text(
+        f"📋 *План на сьогодні*\n\n"
+        f"⏰ *Нагадування:*\n{reminder_section}\n\n"
+        f"🥗 *Харчування:*\n{food_section}"
+        f"{weight_line}",
         parse_mode="Markdown",
     )
 
@@ -380,21 +456,21 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delta   = last_w - first_w
         sign    = "+" if delta >= 0 else ""
         weight_section = (
-            f"\n⚖️ *Weight (last 7 days)*\n"
-            f"  Start: {first_w} kg → Latest: {last_w} kg\n"
-            f"  Change: *{sign}{delta:.1f} kg*\n"
+            f"\n⚖️ *Вага (останні 7 днів)*\n"
+            f"  Початок: {first_w} кг → Зараз: {last_w} кг\n"
+            f"  Зміна: *{sign}{delta:.1f} кг*\n"
         )
     else:
-        weight_section = "\n⚖️ No weight entries this week.\n"
+        weight_section = "\n⚖️ Немає записів ваги цього тижня.\n"
 
     await update.message.reply_text(
-        f"📊 *Weekly Summary*\n\n"
-        f"🍽 *Nutrition (last 7 days)*\n"
-        f"  Meals logged: {len(foods)}\n"
-        f"  Total calories: *{total_cal:.0f} kcal*\n"
-        f"  Avg/day: *{avg_cal:.0f} kcal*\n"
-        f"  Total protein: *{total_prot:.1f} g*\n"
-        f"  Avg/day: *{avg_prot:.1f} g*\n"
+        f"📊 *Тижнева статистика*\n\n"
+        f"🍽 *Харчування (останні 7 днів)*\n"
+        f"  Прийомів їжі: {len(foods)}\n"
+        f"  Всього калорій: *{total_cal:.0f} ккал*\n"
+        f"  Середньо/день: *{avg_cal:.0f} ккал*\n"
+        f"  Всього білка: *{total_prot:.1f} г*\n"
+        f"  Середньо/день: *{avg_prot:.1f} г*\n"
         f"{weight_section}",
         parse_mode="Markdown",
     )
@@ -403,39 +479,46 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /reminders conversation ────────────────────────────────────────────────────
 
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id  = update.effective_user.id
+    """Показує меню нагадувань і входить у ConversationHandler."""
+    await _show_reminders_menu(update.message, update.effective_user.id)
+    return WAITING_REMINDER_SELECT
+
+
+async def _show_reminders_menu(message, user_id: int):
+    """Будує і надсилає inline-клавіатуру меню нагадувань."""
     existing = {r["reminder_type"]: r["time"] for r in db.get_user_reminders(user_id)}
 
     keyboard = []
     for rtype, label in REMINDER_TYPES.items():
         t = existing.get(rtype)
-        btn = f"{label} ✅ {t}" if t else f"{label} — tap to set"
+        btn = f"{label} ✅ {t}" if t else f"{label} — натисни щоб встановити"
         keyboard.append([InlineKeyboardButton(btn, callback_data=f"set_reminder:{rtype}")])
 
     if existing:
-        keyboard.append([InlineKeyboardButton("🗑 Delete a reminder", callback_data="delete_reminder_menu")])
-    keyboard.append([InlineKeyboardButton("❌ Close", callback_data="close")])
+        keyboard.append([InlineKeyboardButton("🗑 Видалити нагадування", callback_data="delete_reminder_menu")])
+    keyboard.append([InlineKeyboardButton("❌ Закрити", callback_data="close")])
 
-    await update.message.reply_text(
-        "⏰ *Reminders*\nSelect a reminder to set or update:",
+    await message.reply_text(
+        "⏰ *Нагадування*\nОбери нагадування щоб встановити або змінити:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
 
 
 async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє натискання кнопок меню нагадувань."""
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
 
     if query.data == "close":
         await query.message.delete()
         return ConversationHandler.END
 
     if query.data == "delete_reminder_menu":
-        user_id  = query.from_user.id
         existing = db.get_user_reminders(user_id)
         if not existing:
-            await query.edit_message_text("You have no reminders set.")
+            await query.edit_message_text("У тебе немає активних нагадувань.")
             return ConversationHandler.END
         keyboard = [
             [InlineKeyboardButton(
@@ -444,18 +527,33 @@ async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )]
             for r in existing
         ]
-        keyboard.append([InlineKeyboardButton("« Back", callback_data="back_reminders")])
+        keyboard.append([InlineKeyboardButton("« Назад", callback_data="back_reminders")])
         await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
-        return ConversationHandler.END
+        return WAITING_REMINDER_SELECT
+
+    if query.data == "back_reminders":
+        existing = {r["reminder_type"]: r["time"] for r in db.get_user_reminders(user_id)}
+        keyboard = []
+        for rtype, label in REMINDER_TYPES.items():
+            t = existing.get(rtype)
+            btn = f"{label} ✅ {t}" if t else f"{label} — натисни щоб встановити"
+            keyboard.append([InlineKeyboardButton(btn, callback_data=f"set_reminder:{rtype}")])
+        if existing:
+            keyboard.append([InlineKeyboardButton("🗑 Видалити нагадування", callback_data="delete_reminder_menu")])
+        keyboard.append([InlineKeyboardButton("❌ Закрити", callback_data="close")])
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
+        return WAITING_REMINDER_SELECT
 
     if query.data.startswith("del_reminder:"):
-        rtype   = query.data.split(":", 1)[1]
-        user_id = query.from_user.id
+        rtype = query.data.split(":", 1)[1]
         db.delete_reminder(user_id, rtype)
         for job in context.application.job_queue.get_jobs_by_name(_reminder_job_name(user_id, rtype)):
             job.schedule_removal()
         label = REMINDER_TYPES.get(rtype, rtype)
-        await query.edit_message_text(f"🗑 Reminder *{label}* deleted.", parse_mode="Markdown")
+        await query.edit_message_text(
+            f"🗑 Нагадування *{label}* видалено.",
+            parse_mode="Markdown",
+        )
         return ConversationHandler.END
 
     if query.data.startswith("set_reminder:"):
@@ -463,53 +561,52 @@ async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pending_reminder_type"] = rtype
         label = REMINDER_TYPES.get(rtype, rtype)
         await query.edit_message_text(
-            f"⏰ Set time for *{label}* reminder.\n\nSend time in *HH:MM* format (24h), e.g. `08:30`",
+            f"⏰ Встанови час для *{label}*.\n\n"
+            f"Надішли час у форматі *HH:MM* або *HHMM* (24г), напр. `08:30` або `0830`",
             parse_mode="Markdown",
         )
         return WAITING_REMINDER_TIME
 
-    return ConversationHandler.END
+    return WAITING_REMINDER_SELECT
 
 
 async def receive_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Парсить введений час і зберігає нагадування."""
     text    = update.message.text.strip()
     user_id = update.effective_user.id
     rtype   = context.user_data.get("pending_reminder_type")
 
-    if not re.match(r"^\d{1,2}:\d{2}$", text):
+    parsed = _parse_time(text)
+    if parsed is None:
         await update.message.reply_text(
-            "⚠️ Invalid format. Please send time as *HH:MM*, e.g. `07:30`",
+            "⚠️ Невірний формат. Введи час як *HH:MM* або *HHMM*, напр. `07:30` або `0730`",
             parse_mode="Markdown",
         )
         return WAITING_REMINDER_TIME
 
-    hour, minute = map(int, text.split(":"))
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        await update.message.reply_text("⚠️ Invalid time. Hour 0-23, minute 0-59.")
-        return WAITING_REMINDER_TIME
-
+    hour, minute = parsed
     time_str = f"{hour:02d}:{minute:02d}"
     db.set_reminder(user_id, rtype, time_str)
     _schedule_reminder(context.application, user_id, rtype, time_str)
 
     label = REMINDER_TYPES.get(rtype, rtype)
     await update.message.reply_text(
-        f"✅ Reminder set!\n{label} — every day at *{time_str}*",
+        f"✅ Нагадування встановлено!\n{label} — щодня о *{time_str}*",
         parse_mode="Markdown",
     )
     context.user_data.pop("pending_reminder_type", None)
     return ConversationHandler.END
 
 
-# ── Shared cancel ──────────────────────────────────────────────────────────────
+# ── Скасування ─────────────────────────────────────────────────────────────────
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Cancelled.")
+    await update.message.reply_text("Скасовано.")
     return ConversationHandler.END
 
 
-# ── Startup: restore reminders from DB ────────────────────────────────────────
+# ── Старт: відновлення нагадувань з БД ────────────────────────────────────────
 
 async def on_startup(app: Application):
     reminders = db.get_all_reminders()
@@ -517,16 +614,16 @@ async def on_startup(app: Application):
         try:
             _schedule_reminder(app, r["user_id"], r["reminder_type"], r["time"])
         except Exception as e:
-            logger.warning("Failed to restore reminder %s: %s", r, e)
-    logger.info("Restored %d reminder(s) from database.", len(reminders))
+            logger.warning("Не вдалось відновити нагадування %s: %s", r, e)
+    logger.info("Відновлено %d нагадувань з бази даних.", len(reminders))
 
 
-# ── Bot assembly ───────────────────────────────────────────────────────────────
+# ── Збирання бота ──────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    # /log: search → select product (inline) → enter grams
+    # /log: пошук → вибір продукту (inline) → введення грамів
     log_conv = ConversationHandler(
         entry_points=[CommandHandler("log", cmd_log)],
         states={
@@ -541,7 +638,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # /addproduct: name → calories → protein
+    # /addproduct: назва → калорії → білок
     addproduct_conv = ConversationHandler(
         entry_points=[CommandHandler("addproduct", cmd_addproduct)],
         states={
@@ -559,32 +656,35 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # /reminders: inline menu → time input
+    # /reminders: меню (inline) → введення часу
+    # ВИПРАВЛЕНО: cmd_reminders тепер повертає WAITING_REMINDER_SELECT,
+    # тому ConversationHandler правильно перехоплює наступні натискання кнопок.
     reminder_conv = ConversationHandler(
         entry_points=[CommandHandler("reminders", cmd_reminders)],
         states={
+            WAITING_REMINDER_SELECT: [
+                CallbackQueryHandler(reminder_callback),
+            ],
             WAITING_REMINDER_TIME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reminder_time),
-            ],
-            ConversationHandler.WAITING: [
-                CallbackQueryHandler(reminder_callback),
+                CallbackQueryHandler(reminder_callback),  # кнопка «Назад» зсередини
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("plan",   cmd_plan))
+    app.add_handler(CommandHandler("stats",  cmd_stats))
     app.add_handler(log_conv)
     app.add_handler(addproduct_conv)
     app.add_handler(weight_conv)
     app.add_handler(reminder_conv)
-    app.add_handler(CallbackQueryHandler(reminder_callback))  # catch-all for reminder buttons
 
-    logger.info("Trackie bot is running...")
+    logger.info("Trackie бот запущено...")
     app.run_polling(drop_pending_updates=True)
 
 
